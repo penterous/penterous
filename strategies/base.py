@@ -1,0 +1,218 @@
+"""
+Penterous — Abstract base class for all exploit strategies.
+"""
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+import time
+import os
+import subprocess
+import resource
+
+from utils.pwntools_wrap import PWNTOOLS_AVAILABLE, make_process, make_remote
+from utils.logger import info, success, warning, error
+
+
+def _ensure_flag_txt(cwd: str) -> bool:
+    """Crée flag.txt dans cwd si absent — nécessaire pour les binaires qui l'ouvrent."""
+    import os
+    flag_path = os.path.join(cwd, 'flag.txt')
+    if not os.path.exists(flag_path):
+        try:
+            with open(flag_path, 'w') as f:
+                f.write('CTF{placeholder_flag_created_by_penterous}\n')
+            return True  # créé par nous
+        except Exception:
+            pass
+    return False  # déjà existant
+
+
+def _disable_core_dumps():
+    """Suppress core dump generation in child process (preexec_fn)."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+    # Also zero out coredump_filter so no memory segments are dumped
+    try:
+        with open('/proc/self/coredump_filter', 'w') as f:
+            f.write('0\n')
+    except Exception:
+        pass
+
+
+@dataclass
+class ExploitResult:
+    """Single ExploitResult used by ALL strategies and the engine."""
+    success: bool
+    flag: Optional[str]
+    strategy_used: str
+    offset: int
+    payload: bytes
+    output: bytes
+    duration: float
+    error_msg: str = ""
+    libc_base: int = 0
+    rop_chain_str: str = ""
+    mode: str = "local"
+    remote_host: str = ""
+    remote_port: int = 0
+    # These fields are filled in by ExploitEngine after execute() returns:
+    remote_flag: Optional[str] = None
+    exploit_script: str = ""
+    # Format-string specific — filled during exploit for accurate script gen:
+    fmt_offset: int = 0
+    leaked_sym: str = ""      # e.g. 'setvbuf'
+    got_target_name: str = "" # e.g. 'puts'
+    libc_name: str = ""       # e.g. 'libc.so.6'
+
+
+class ExploitStrategy(ABC):
+    def __init__(self, binary, offset: int, rop_builder,
+                 flag_hunter, timeout: int = 30, verbose: bool = False):
+        self.binary = binary
+        self.offset = offset
+        self.rop = rop_builder
+        self.hunter = flag_hunter
+        self.timeout = timeout
+        self.verbose = verbose
+
+    @abstractmethod
+    def execute(self, mode: str = 'local', host: str = None, port: int = None) -> ExploitResult:
+        pass
+
+    # ------------------------------------------------------------------
+    # LOCAL: pwntools process (PTY) — handles output buffering correctly
+    # ------------------------------------------------------------------
+    def _exec_local(self, payload: bytes) -> bytes:
+        """
+        Run the binary locally and capture all output.
+
+        Uses pwntools process() when available (PTY = line-buffered stdout),
+        which ensures the flag is flushed even when the process crashes.
+        Falls back to subprocess.Popen otherwise.
+        """
+        if PWNTOOLS_AVAILABLE:
+            return self._exec_local_pwntools(payload)
+        return self._exec_local_subprocess(payload)
+
+    def _exec_local_pwntools(self, payload: bytes) -> bytes:
+        """Use pwntools process() with a PTY so stdout stays line-buffered."""
+        try:
+            import pwn
+            pwn.context.log_level = 'error'
+            binary_path = self.binary.path
+            cwd = os.path.dirname(os.path.abspath(binary_path))
+            _ensure_flag_txt(cwd)
+            # Run from /tmp to prevent core dumps from landing in the binary dir
+            p = pwn.process(binary_path, cwd=cwd, stdin=pwn.PIPE,
+                            stdout=pwn.PIPE, stderr=pwn.STDOUT,
+                            preexec_fn=_disable_core_dumps)
+            try:
+                p.sendline(payload)
+                out = p.recvall(timeout=self.timeout)
+            except Exception:
+                try:
+                    out = p.recv(timeout=2)
+                except Exception:
+                    out = b''
+            finally:
+                try:
+                    p.close()
+                except Exception:
+                    pass
+            if out:
+                decoded = out.decode('utf-8', errors='replace').strip()
+                if decoded:
+                    info(f"Process output: {decoded[:300]}")
+            return out
+        except Exception as e:
+            error(f"pwntools local exec error: {e}")
+            return self._exec_local_subprocess(payload)
+
+    def _exec_local_subprocess(self, payload: bytes) -> bytes:
+        """Fallback when pwntools is unavailable."""
+        binary_path = self.binary.path
+        cwd = os.path.dirname(os.path.abspath(binary_path))
+        _ensure_flag_txt(cwd)
+        try:
+            proc = subprocess.Popen(
+                [binary_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=_disable_core_dumps,
+                cwd=cwd,
+            )
+            stdout, stderr = proc.communicate(
+                input=payload + b'\n',
+                timeout=self.timeout,
+            )
+            out = stdout + stderr
+            if out:
+                decoded = out.decode('utf-8', errors='replace').strip()
+                if decoded:
+                    info(f"Process output: {decoded[:300]}")
+            return out
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            error("Process timed out")
+            return b''
+        except Exception as e:
+            error(f"Local exec error: {e}")
+            return b''
+
+    # ------------------------------------------------------------------
+    # REMOTE: pwntools tube
+    # ------------------------------------------------------------------
+    def _get_tube(self, host: str, port: int):
+        if not PWNTOOLS_AVAILABLE:
+            return None
+        try:
+            return make_remote(host, port)
+        except Exception as e:
+            error(f"Connection failed: {e}")
+            return None
+
+    def _send_and_receive_remote(self, tube, payload: bytes) -> bytes:
+        try:
+            try:
+                tube.recv(timeout=3)
+            except Exception:
+                pass
+            tube.sendline(payload)
+            try:
+                out = tube.recvall(timeout=self.timeout)
+            except Exception:
+                try:
+                    out = tube.recv(timeout=5)
+                except Exception:
+                    out = b''
+            return out
+        except Exception as e:
+            error(f"Remote send/receive error: {e}")
+            return b''
+        finally:
+            try:
+                tube.close()
+            except Exception:
+                pass
+
+    def _make_result(self, success_: bool, flag: Optional[str], strategy: str,
+                     payload: bytes, output: bytes, start_time: float,
+                     error_msg: str = "", mode: str = "local",
+                     host: str = "", port: int = 0) -> ExploitResult:
+        return ExploitResult(
+            success=success_,
+            flag=flag,
+            strategy_used=strategy,
+            offset=self.offset,
+            payload=payload,
+            output=output,
+            duration=time.time() - start_time,
+            error_msg=error_msg,
+            mode=mode,
+            remote_host=host,
+            remote_port=port,
+        )

