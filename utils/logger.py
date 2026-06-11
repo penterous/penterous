@@ -41,7 +41,8 @@ BANNER = (
     "╚═╝     ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝\n"
     "\n"
     "  by p3nt2r0us  |  Binary Exploitation Framework  |  CTF Training Tool\n\n"
-    "  Github: https://github.com/penterous/penterous.git\n"
+    "  Github: https://github.com/penterous/penterous.git\n\n"
+    "  Profil linkedln: https://www.linkedin.com/in/ricardo-finangnon-81b84a322\n"
     "\n"
 )
 def print_banner():
